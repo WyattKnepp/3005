@@ -6,6 +6,7 @@
   morekeywords={fn,let,mut,match,struct,impl,const,static,use,pub,loop,while,for,in,if,else,move,macro_rules}}
 \title{A Tiny Media Server in Rust\\\large Notes for a C++ Programmer Who Has Never Seen Rust}
 \date{}
+\emergencystretch=3em
 \begin{document}
 \maketitle
 \tableofcontents
@@ -15,7 +16,7 @@ A program that listens on a TCP port and answers every connection with one audio
 
 \begin{itemize}
 \item \texttt{src/main.rs} -- the whole server (about 80 lines).
-\item \texttt{media/sample.mp3} -- the file that gets embedded. Replace it and rebuild.
+\item \texttt{media/3005.bbd} -- the file that gets embedded. Replace it and rebuild.
 \item \texttt{Cargo.toml} -- project and optimisation settings.
 \item \texttt{.cargo/config.toml} -- makes the default build target static Linux (musl).
 \end{itemize}
@@ -81,7 +82,7 @@ The port is hardcoded to 3005. The line \texttt{const \_: () = assert!(PORT == 0
 
 \begin{lstlisting}
 const PORT: u16 = 3005;
-macro_rules! media_path { () => { "../media/sample.mp3" }; }
+macro_rules! media_path { () => { "../media/3005.bbd" }; }
 const PATH: &str = media_path!();
 static MEDIA: &[u8] = include_bytes!(media_path!());
 \end{lstlisting}
@@ -120,7 +121,7 @@ When you seek, or when Safari/iOS opens media, the browser sends \texttt{Range: 
 If a program closes a TCP socket while unread data is still in its receive buffer, Linux sends a \emph{RST} (reset) instead of a normal \emph{FIN}. A RST can make the client discard response bytes that were still in flight, truncating the file. So after writing we call \texttt{shutdown(Write)} (sends FIN -- ``I'm done sending'') and then read until the client closes its side, and only then drop the socket.
 
 \section{Cargo.toml and the build}
-\begin{center}\begin{tabular}{ll}\toprule
+\begin{center}\begin{tabular}{lp{0.6\textwidth}}\toprule
 Setting & Effect \\\midrule
 \texttt{opt-level = 3} & like \texttt{-O3} \\
 \texttt{lto = "fat"} & whole-program link-time optimisation \\
@@ -135,14 +136,25 @@ The target \texttt{x86\_64-unknown-linux-musl} links against musl libc staticall
 curl -I localhost:3005                  # headers
 curl -r 0-99 -o part.bin localhost:3005 # 206, exactly 100 bytes
 curl -o all.bin localhost:3005
-cmp all.bin media/sample.mp3            # no output = identical
+cmp all.bin media/3005.bbd            # no output = identical
 \end{lstlisting}
 \texttt{curl -I} sends a HEAD request; because we do not parse methods the server also sends the body, which curl ignores.
 
+\section{Security review}
+Threat model: anyone who can reach port 3005 sends arbitrary bytes. Goal: they can't run code, escalate, or kill the server.
+\begin{itemize}
+\item \textbf{No memory-unsafe code.} \texttt{\#![forbid(unsafe\_code)]} makes the compiler reject any \texttt{unsafe} block, and there are no dependencies, so buffer overflows and use-after-free are not possible in this program.
+\item \textbf{Request is never interpreted.} Only the \texttt{Range} header is read, and its numbers are parsed with overflow-checked \texttt{parse} and clamped to the file length. No input is ever echoed into a response (no header injection), used as a file path (no traversal), or passed to a shell. The audio is embedded, so the server never opens files at runtime.
+\item \textbf{Panic = total outage.} With \texttt{panic = "abort"} any panic kills the whole server. Two panic sources were removed: slicing a \texttt{\&str} at a non-character boundary (a \texttt{Range:} line containing multibyte UTF-8 would have crashed the process, so parsing is now done on raw bytes) and \texttt{thread::spawn} failing (now \texttt{Builder::spawn}, whose error is handled).
+\item \textbf{Resource limits.} Max 256 simultaneous connections (extras are closed immediately), 16\,KiB request cap, 10\,s read/write timeouts, bounded post-response drain, 64\,KiB thread stacks, and a header scan that is linear (not quadratic) in slow-drip input.
+\item \textbf{Privilege.} The server refuses to start as root (it checks the effective uid in \texttt{/proc/self/ status}). Port 3005 is above 1024, so root is never needed. Run it as an unprivileged user, ideally under systemd with \texttt{DynamicUser=yes}, \texttt{NoNewPrivileges=yes}, \texttt{ProtectSystem=strict}, \texttt{ProtectHome=yes}, \texttt{PrivateTmp=yes}. The static binary needs no files at all.
+\item \textbf{Audio-specific.} The server treats the file as opaque bytes and never decodes it, so a malformed MP3 cannot exploit the server. It could only target the \emph{listener's} decoder, so embed only audio you trust. Responses carry \texttt{X-Content-Type-Options: nosniff} (the browser must treat the bytes as audio, never sniff HTML/JS out of them) and \texttt{Content-Security-Policy: sandbox}.
+\item \textbf{Not covered.} No TLS (traffic is plaintext, visible and modifiable on the network), and bandwidth floods must be handled upstream. No software can honestly be called ``provably'' secure; this is a small, dependency-free design reviewed and tested against the cases above.
+\end{itemize}
+
 \section{Limitations and exercises}
 \begin{itemize}
-\item One thread per connection is simple but unbounded; a flood of connections means a flood of threads.
-\item No read timeout: a client that connects and sends nothing holds a thread forever (try \texttt{s.set\_read\_timeout}).
+\item A client that reads very slowly can hold one of the 256 connection slots for a long time (each individual read/write has a 10\,s timeout, but a whole transfer does not). Put a reverse proxy or firewall rate limit in front for hostile networks.
 \item No HEAD, 404, 416 handling -- by design.
 \item Exercise: support the suffix form \texttt{bytes=-500}.
 \item Exercise: switch to \texttt{.mp4} (change the macro, drop in a file) and check the \texttt{Content-Type}.

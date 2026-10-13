@@ -1,0 +1,150 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{listings,xcolor,hyperref,booktabs}
+\lstset{basicstyle=\ttfamily\small,breaklines=true,frame=single,columns=fullflexible,
+  keywordstyle=\color{blue},commentstyle=\color{gray},showstringspaces=false,
+  morekeywords={fn,let,mut,match,struct,impl,const,static,use,pub,loop,while,for,in,if,else,move,macro_rules}}
+\title{A Tiny Media Server in Rust\\\large Notes for a C++ Programmer Who Has Never Seen Rust}
+\date{}
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{What we built}
+A program that listens on a TCP port and answers every connection with one audio (or video) file baked into the executable. Open \texttt{http://localhost:3005} in a browser and it plays.
+
+\begin{itemize}
+\item \texttt{src/main.rs} -- the whole server (about 80 lines).
+\item \texttt{media/sample.mp3} -- the file that gets embedded. Replace it and rebuild.
+\item \texttt{Cargo.toml} -- project and optimisation settings.
+\item \texttt{.cargo/config.toml} -- makes the default build target static Linux (musl).
+\end{itemize}
+
+Build and run:
+\begin{lstlisting}[language=bash]
+cargo build --release
+./target/x86_64-unknown-linux-musl/release/mediaserver
+\end{lstlisting}
+
+\section{Rust from the ground up (for C++ people)}
+\subsection{Tooling}
+\texttt{cargo} is CMake + a package manager + a test runner in one. \texttt{rustc} is the compiler (like \texttt{g++}); you almost never call it directly. \texttt{cargo build --release} is an optimised build; plain \texttt{cargo build} is a debug build.
+
+\subsection{Basic syntax}
+\begin{lstlisting}
+fn add(a: i32, b: i32) -> i32 {   // types come after names
+    a + b                          // no semicolon = this is the return value
+}
+let x = 5;          // immutable by default (like const auto)
+let mut y = 5;      // mutable
+const PORT: u16 = 3005;   // compile-time constant, type required
+\end{lstlisting}
+Integer types are explicit: \texttt{u8, u16, u32, u64, usize} (unsigned; \texttt{usize} is pointer-sized, like \texttt{size\_t}) and \texttt{i8..i64, isize} (signed). Almost everything is an expression: \texttt{if}, \texttt{match} and blocks all produce values.
+
+\subsection{Ownership and borrowing}
+This is the big difference from C++. Every value has exactly one owner; when the owner goes out of scope the value is dropped (RAII, always). Assigning or passing a value \emph{moves} it -- the old name becomes unusable (like \texttt{std::move}, but enforced by the compiler). Instead of moving you can \emph{borrow}:
+
+\begin{center}\begin{tabular}{ll}\toprule
+Rust & Roughly C++ \\\midrule
+\texttt{\&T} & \texttt{const T\&} (many allowed at once) \\
+\texttt{\&mut T} & \texttt{T\&} (exactly one, and no \texttt{\&T} at the same time) \\
+\texttt{Vec<u8>} & \texttt{std::vector<uint8\_t>} \\
+\texttt{\&[u8]} & \texttt{std::span<const uint8\_t>} (pointer + length, a ``slice'') \\
+\texttt{String} / \texttt{\&str} & \texttt{std::string} / \texttt{std::string\_view} \\
+\texttt{Box<T>} & \texttt{std::unique\_ptr<T>} \\
+\texttt{Option<T>} & \texttt{std::optional<T>} \\
+\texttt{Result<T,E>} & value-or-error (no exceptions in Rust) \\
+\bottomrule\end{tabular}\end{center}
+
+The compiler proves at build time that no reference outlives what it points to and that you never have a data race. That removes dangling pointers and use-after-free in safe code.
+
+\subsection{Lifetimes and \texttt{'static}}
+A reference type can carry a lifetime: \texttt{\&'a [u8]}. \texttt{\&'static} means ``valid for the whole program''. String literals and \texttt{include\_bytes!} data are \texttt{'static} because they live in the executable's read-only data.
+
+\subsection{Errors: \texttt{Result}, \texttt{?}, \texttt{Option}}
+\begin{lstlisting}
+let n = s.read(&mut buf)?;   // if Err, return it from this function immediately
+let v = x.expect("msg");     // if Err/None, crash with msg (fine at startup)
+let _ = might_fail();        // deliberately ignore a result
+\end{lstlisting}
+Ignoring a \texttt{Result} without \texttt{let \_ =} produces a compiler warning -- Rust makes you say that you meant it.
+
+\subsection{Structs, modules, macros}
+\texttt{struct Resp \{ ... \}} is a plain data type (no inheritance). Names ending in \texttt{!} (\texttt{include\_bytes!}, \texttt{format!}, \texttt{macro\_rules!}) are macros, expanded at compile time -- hygienic, and far saner than the C preprocessor. \texttt{use std::io::Read;} is like \texttt{using}/\texttt{\#include}: it brings a name (here a \emph{trait}, similar to an interface) into scope so its methods can be called.
+
+\subsection{Closures and threads}
+\texttt{|a, b| a + b} is a lambda. \texttt{move || ...} captures by value, i.e.\ the closure takes ownership of what it uses. \texttt{std::thread::spawn(closure)} runs it on a new OS thread. The compiler only allows data to cross into a thread if it is safe to do so -- here, either owned by the closure or \texttt{'static}.
+
+\section{Walking through \texttt{main.rs}}
+\subsection{Constants and embedding the file}
+The port is hardcoded to 3005. The line \texttt{const \_: () = assert!(PORT == 0x0BBD, ...)} is evaluated by the compiler: \texttt{0x0BBD} is 3005 in hexadecimal ($11\cdot256+11\cdot16+13$), so editing \texttt{PORT} to any other value is a \emph{build error}, not a runtime one. (\texttt{const \_} is an unnamed constant whose only job is to run the check, similar to a C++ \texttt{static\_assert}.)
+
+\begin{lstlisting}
+const PORT: u16 = 3005;
+macro_rules! media_path { () => { "../media/sample.mp3" }; }
+const PATH: &str = media_path!();
+static MEDIA: &[u8] = include_bytes!(media_path!());
+\end{lstlisting}
+\texttt{include\_bytes!} reads the file at \emph{compile time} and puts its bytes in the executable (think \texttt{xxd -i}, built in). Its argument must be a string literal, not a \texttt{const}, so a tiny macro supplies the path in one place; the same text is reused as \texttt{PATH} to choose the MIME type. The path is relative to the source file (\texttt{src/}), hence \texttt{../media}.
+
+\subsection{Building one buffer at startup}
+We format the header once, append the body, then \texttt{Box::leak} the buffer. \texttt{Box::leak} deliberately never frees the memory and hands back a \texttt{\&'static mut}; we use it as an immutable \texttt{\&'static [u8]}. Leaking is fine because the data should live as long as the process, and being \texttt{'static} lets every thread share it with no locks and no reference counting.
+
+The header is:
+\begin{lstlisting}
+HTTP/1.1 200 OK\r\n
+Content-Type: audio/mpeg\r\n
+Content-Length: <n>\r\n
+Accept-Ranges: bytes\r\n
+Connection: close\r\n
+\r\n
+\end{lstlisting}
+HTTP headers end with an empty line (\verb|\r\n\r\n|). \texttt{Content-Length} tells the browser when the body ends; \texttt{Connection: close} says we won't reuse the socket. \texttt{Accept-Ranges} advertises seeking support (an addition to the minimum list; Safari likes it).
+
+\subsection{The accept loop}
+\begin{lstlisting}
+let listener = TcpListener::bind(("0.0.0.0", PORT)).expect("bind");
+for stream in listener.incoming().flatten() {
+    std::thread::spawn(move || { let _ = handle(stream, resp); });
+}
+\end{lstlisting}
+\texttt{TcpListener} wraps \texttt{socket/bind/listen/accept}. \texttt{incoming()} yields a \texttt{Result<TcpStream>} for each connection; \texttt{.flatten()} drops the failures. Each accepted stream is \emph{moved} into a fresh thread. When \texttt{handle} returns, the stream is dropped, which closes the socket (RAII).
+
+\subsection{Reading the request}
+We loop on \texttt{read} until the bytes seen so far contain \verb|\r\n\r\n| (capped at 64 KiB so a rude client can't make us buffer forever). We never parse the method or path -- every URL gets the same file.
+
+\subsection{Range requests}
+When you seek, or when Safari/iOS opens media, the browser sends \texttt{Range: bytes=100-199}. We answer \texttt{206 Partial Content} with \texttt{Content-Range: bytes 100-199/total} and only those bytes. \texttt{parse\_range} accepts a single \texttt{bytes=a-b} or \texttt{bytes=a-}; anything else (multiple ranges, suffix form \texttt{-500}, garbage, out-of-bounds start) returns \texttt{None} and we fall back to the full 200. The end is clamped to the last byte. A 206 header depends on the request so it is formatted per request (the 200 path remains one pre-built \texttt{write\_all}); the body slice is zero-copy: \texttt{\&body[a..=b]}.
+
+\subsection{Why drain before closing?}
+If a program closes a TCP socket while unread data is still in its receive buffer, Linux sends a \emph{RST} (reset) instead of a normal \emph{FIN}. A RST can make the client discard response bytes that were still in flight, truncating the file. So after writing we call \texttt{shutdown(Write)} (sends FIN -- ``I'm done sending'') and then read until the client closes its side, and only then drop the socket.
+
+\section{Cargo.toml and the build}
+\begin{center}\begin{tabular}{ll}\toprule
+Setting & Effect \\\midrule
+\texttt{opt-level = 3} & like \texttt{-O3} \\
+\texttt{lto = "fat"} & whole-program link-time optimisation \\
+\texttt{codegen-units = 1} & one unit: slower compile, better optimisation \\
+\texttt{panic = "abort"} & a panic kills the process (no unwinding code); a panic in one connection thread therefore takes down the whole server \\
+\texttt{strip = true} & remove symbols; smaller binary \\
+\bottomrule\end{tabular}\end{center}
+The target \texttt{x86\_64-unknown-linux-musl} links against musl libc statically, so the binary has no dependencies and runs on any x86-64 Linux. One-time setup: \texttt{rustup target add x86\_64-unknown-linux-musl}. No \texttt{libc} crate or \texttt{sendfile} was needed; with the file in memory, \texttt{write\_all} is already a straight copy to the kernel.
+
+\section{Verifying it}
+\begin{lstlisting}[language=bash]
+curl -I localhost:3005                  # headers
+curl -r 0-99 -o part.bin localhost:3005 # 206, exactly 100 bytes
+curl -o all.bin localhost:3005
+cmp all.bin media/sample.mp3            # no output = identical
+\end{lstlisting}
+\texttt{curl -I} sends a HEAD request; because we do not parse methods the server also sends the body, which curl ignores.
+
+\section{Limitations and exercises}
+\begin{itemize}
+\item One thread per connection is simple but unbounded; a flood of connections means a flood of threads.
+\item No read timeout: a client that connects and sends nothing holds a thread forever (try \texttt{s.set\_read\_timeout}).
+\item No HEAD, 404, 416 handling -- by design.
+\item Exercise: support the suffix form \texttt{bytes=-500}.
+\item Exercise: switch to \texttt{.mp4} (change the macro, drop in a file) and check the \texttt{Content-Type}.
+\end{itemize}
+\end{document}

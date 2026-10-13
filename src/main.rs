@@ -41,9 +41,9 @@ fn main() {
         std::process::exit(1);
     }
     let mime = if PATH.ends_with(".mp4") { "video/mp4" } else { "audio/mpeg" };
-    // nosniff stops browsers from treating the bytes as HTML/JS; sandbox CSP neuters anything that slips through.
+    // nosniff stops browsers from treating the bytes as HTML/JS. (No CSP sandbox: it breaks the browser media player.)
     let common = format!(
-        "Content-Type: {mime}\r\nAccept-Ranges: bytes\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: sandbox\r\nConnection: close\r\n"
+        "Content-Type: {mime}\r\nAccept-Ranges: bytes\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n"
     );
     let mut buf = format!("HTTP/1.1 200 OK\r\n{common}Content-Length: {}\r\n\r\n", MEDIA.len()).into_bytes();
     let head_len = buf.len();
@@ -52,7 +52,8 @@ fn main() {
     let head_206: &'static str = Box::leak(format!("HTTP/1.1 206 Partial Content\r\n{common}").into_boxed_str());
     let resp: &'static Resp = Box::leak(Box::new(Resp { full, body: &full[head_len..], head_206 }));
 
-    let listener = TcpListener::bind(("0.0.0.0", PORT)).expect("bind");
+    // "::" is dual-stack on Linux (accepts IPv4 too), so http://localhost works whether it resolves to ::1 or 127.0.0.1.
+    let listener = TcpListener::bind(("::", PORT)).or_else(|_| TcpListener::bind(("0.0.0.0", PORT))).expect("bind");
     for stream in listener.incoming().flatten() {
         if LIVE.fetch_add(1, Relaxed) >= MAX_CONNS {
             LIVE.fetch_sub(1, Relaxed);
